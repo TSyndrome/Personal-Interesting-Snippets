@@ -94,174 +94,94 @@ class Migration(migrations.Migration):
     ]
 
 
-from rest_framework import serializers
-
-from .models import Message, User, UserConversationHistory, UserFeedback
-
-
-# --- REUSED MINIMAL SERIALIZER ---
-class UserMinimalSerializer(serializers.ModelSerializer):
-    display_name = serializers.SerializerMethodField()
-
-    class Meta:
-        model = User
-        fields = ["username", "first_name", "last_name", "display_name"]
-
-    def get_display_name(self, obj):
-        first = (obj.first_name or "").strip()
-        last = (obj.last_name or "").strip()
-        return f"{last}, {first}".strip(", ") if (first or last) else obj.username
-
-
-# --- ADMIN VIEW SERIALIZERS ---
-
-
-class AdminFeedbackSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = UserFeedback
-        fields = [
-            "id",
-            "liked",
-            "feedback_category",
-            "free_text_feedback",
-            "created_at",
-        ]
-
-
-class AdminMessageSerializer(serializers.ModelSerializer):
-    feedback = AdminFeedbackSerializer(read_only=True)
-
-    class Meta:
-        model = Message
-        fields = ["id", "message_role", "text", "metadata", "created_at", "feedback"]
-
-
-class AdminNegativeConversationSerializer(serializers.ModelSerializer):
-    # Reuse the minimal user serializer for cleaner nested data
-    user = UserMinimalSerializer(read_only=True)
-
-    # Nested transcript
-    messages = AdminMessageSerializer(many=True, read_only=True)
-
-    project_name = serializers.CharField(source="project.name", read_only=True)
-
-    class Meta:
-        model = UserConversationHistory
-        fields = [
-            "id",
-            "preview_title",
-            "preview_content",  #
-            "user",  # Reused Serializer
-            "project_name",
-            "retrieved_documents",  #
-            "metadata",  #
-            "conversation_thread",  # Full JSON thread if stored here
-            "created_at",
-            "messages",  # The computed message list from the view
-        ]
-
-
-from django.db.models import Prefetch
 from django.shortcuts import get_object_or_404
-from drf_spectacular.utils import OpenApiParameter, OpenApiTypes, extend_schema
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    OpenApiTypes,
+    extend_schema,
+    extend_schema_view,
+)
 from rest_framework import status
-from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
+from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.generics import GenericAPIView
-from rest_framework.permissions import IsAdminUser
+from rest_framework.permissions import IsAdminUser, IsAuthenticated
 
 from .mixins import PaginatedAPIMixin
-from .models import Message, Project, UserConversationHistory
-from .serializers import AdminNegativeConversationSerializer
+from .models import Project, UserConversationHistory
+from .permissions import TenantAccessPermission
+from .serializers import AdminConversationCardSerializer
 from .utils import format_response_payload
 
-# from .permissions import TenantAccessPermission
 
-
-class AdminNegativeConversationsView(PaginatedAPIMixin, GenericAPIView):
-    """
-    Admin-only view.
-    Returns full conversation histories for any conversation that contains
-    at least one message with negative feedback (liked=False).
-    """
-
-    serializer_class = AdminNegativeConversationSerializer
-    permission_classes = [IsAdminUser, TenantAccessPermission]
-
-    def get_base_queryset(self):
-        """
-        Called by PaginatedAPIMixin to get the data.
-        Performs Validation, Security Checks, and Query Optimization.
-        """
-        # 1. VALIDATE PARAMETERS
-        project_id = self.request.query_params.get("project_id")
-        if not project_id:
-            raise ValidationError({"project_id": "This query parameter is required."})
-
-        # 2. SECURITY: FETCH PROJECT & CHECK PERMISSIONS
-        # We explicitly check permissions here because List views don't do it automatically for filtered objects.
-        try:
-            project = Project.objects.get(guid=project_id)
-        except Project.DoesNotExist:
-            raise NotFound(f"Project with GUID {project_id} not found.")
-
-        # This raises PermissionDenied if checks fail
-        self.check_object_permissions(self.request, project)
-
-        # 3. CONSTRUCT OPTIMIZED QUERY
-        messages_prefetch = Prefetch(
-            "messages",
-            queryset=Message.objects.select_related("feedback").order_by("created_at"),
-        )
-
-        return (
-            UserConversationHistory.objects.filter(
-                project=project, messages__feedback__liked=False
-            )
-            .distinct()
-            .prefetch_related(messages_prefetch)
-            .select_related("user", "project")
-            .order_by("-created_at")
-        )
-
-    @extend_schema(
-        summary="List Negative Feedback Conversations",
-        description="Retrieves full conversation transcripts for any session containing negative feedback.",
+@extend_schema_view(
+    get=extend_schema(
+        summary="List Negative Conversation Cards",
+        description="Returns a lightweight list of all conversations in the project containing negative feedback.",
         parameters=[
             OpenApiParameter(
                 name="project_id",
                 type=OpenApiTypes.UUID,
                 location=OpenApiParameter.QUERY,
-                description="The GUID of the project to filter by.",
                 required=True,
             ),
         ],
-        responses={
-            200: AdminNegativeConversationSerializer(many=True),
-            400: "Missing project_id",
-            403: "Permission Denied",
-            404: "Project Not Found",
-        },
+        responses={200: AdminConversationCardSerializer(many=True)},
     )
+)
+class AdminNegativeConversationListView(PaginatedAPIMixin, GenericAPIView):
+    """
+    Paginated List View for Admin Dashboard.
+    Filters: Project + Has Negative Feedback.
+    Output: Minimal 'Card' data.
+    """
+
+    serializer_class = AdminConversationCardSerializer
+    # Adjust permissions as needed (e.g., IsAdminUser)
+    permission_classes = [IsAuthenticated, TenantAccessPermission]
+
+    def get_base_queryset(self):
+        # 1. VALIDATION
+        project_id = self.request.query_params.get("project_id")
+        if not project_id:
+            raise ValidationError({"project_id": "Required."})
+
+        # 2. FETCH PROJECT
+        # get_object_or_404 automatically handles the 404 response
+        project = get_object_or_404(Project, guid=project_id)
+
+        # 3. PERMISSION CHECK
+        # Ensures the requestor has access to this Tenant/Project
+        self.check_object_permissions(self.request, project)
+
+        # 4. OPTIMIZED QUERY
+        # Logic:
+        # - Filter by Project
+        # - Filter where ANY message has liked=False
+        # - distinct() prevents duplicates if a chat has 5 negative messages
+        # - select_related() fetches User + Project in the same SQL query
+        return (
+            UserConversationHistory.objects.filter(
+                project=project, messages__feedback__liked=False
+            )
+            .distinct()
+            .select_related("user", "project")
+            .order_by("-created_at")
+        )
+
     def get(self, request, *args, **kwargs):
         """
-        API Entry point. Wraps the Mixin's list logic with error handling
-        to ensure custom response format.
+        API Entry Point.
         """
         try:
-            # The Mixin calls self.get_base_queryset() internally
+            # Calls get_base_queryset() -> filters -> paginates
             return self.list(request, *args, **kwargs)
 
-        except (ValidationError, NotFound, PermissionDenied) as e:
-            # We catch the standard exceptions raised in get_base_queryset
-            # and format them into your custom payload structure.
-
-            # Map exception types to status codes
-            status_code = status.HTTP_400_BAD_REQUEST
-            if isinstance(e, PermissionDenied):
-                status_code = status.HTTP_403_FORBIDDEN
-            elif isinstance(e, NotFound):
-                status_code = status.HTTP_404_NOT_FOUND
-
+        except (ValidationError, NotFound) as e:
+            status_code = (
+                status.HTTP_404_NOT_FOUND
+                if isinstance(e, NotFound)
+                else status.HTTP_400_BAD_REQUEST
+            )
             return format_response_payload(
                 success=False,
                 message=str(e.detail) if hasattr(e, "detail") else str(e),
