@@ -163,7 +163,14 @@ class AdminNegativeConversationSerializer(serializers.ModelSerializer):
 
 from django.db.models import Prefetch
 from django.shortcuts import get_object_or_404
-from drf_spectacular.utils import OpenApiParameter, OpenApiTypes, extend_schema
+
+# 1. Import extend_schema_view
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    OpenApiTypes,
+    extend_schema,
+    extend_schema_view,
+)
 from rest_framework import status
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.generics import ListAPIView
@@ -174,23 +181,10 @@ from .models import Message, Project, UserConversationHistory
 from .serializers import AdminNegativeConversationSerializer
 from .utils import format_response_payload
 
-# from .permissions import TenantAccessPermission  # <--- Ensure this is imported
 
-
-class AdminNegativeConversationsView(PaginatedAPIMixin, ListAPIView):
-    """
-    Admin-only view.
-    Returns full conversation histories for any conversation that contains
-    at least one message with negative feedback (liked=False).
-    """
-
-    serializer_class = AdminNegativeConversationSerializer
-    permission_classes = [IsAdminUser, TenantAccessPermission]
-
-    def get_queryset(self):
-        return UserConversationHistory.objects.none()
-
-    @extend_schema(
+# 2. Decorate the CLASS, targeting the 'get' method
+@extend_schema_view(
+    get=extend_schema(
         summary="List Negative Feedback Conversations",
         description="Retrieves full conversation transcripts for any session containing negative feedback. Restricted to Admins.",
         parameters=[
@@ -209,10 +203,24 @@ class AdminNegativeConversationsView(PaginatedAPIMixin, ListAPIView):
             404: "Project Not Found",
         },
     )
+)
+class AdminNegativeConversationsView(PaginatedAPIMixin, ListAPIView):
+    """
+    Admin-only view.
+    Returns full conversation histories for any conversation that contains
+    at least one message with negative feedback (liked=False).
+    """
+
+    serializer_class = AdminNegativeConversationSerializer
+    permission_classes = [IsAdminUser, TenantAccessPermission]
+
+    def get_queryset(self):
+        return UserConversationHistory.objects.none()
+
+    # 3. Remove @extend_schema from here (it's now handled by the class decorator)
     def list(self, request, *args, **kwargs):
         project_id = request.query_params.get("project_id")
 
-        # 1. VALIDATION
         if not project_id:
             return format_response_payload(
                 success=False,
@@ -222,12 +230,9 @@ class AdminNegativeConversationsView(PaginatedAPIMixin, ListAPIView):
             )
 
         try:
-            # 2. SECURITY CHECK
             project = get_object_or_404(Project, guid=project_id)
             self.check_object_permissions(request, project)
 
-            # 3. OPTIMIZED QUERY
-            # Prefetch messages and their specific feedback
             messages_prefetch = Prefetch(
                 "messages",
                 queryset=Message.objects.select_related("feedback").order_by(
@@ -235,7 +240,6 @@ class AdminNegativeConversationsView(PaginatedAPIMixin, ListAPIView):
                 ),
             )
 
-            # We fetch columns needed for the serializer (user, project) + the heavy JSON fields
             queryset = (
                 UserConversationHistory.objects.filter(
                     project=project, messages__feedback__liked=False
@@ -246,13 +250,11 @@ class AdminNegativeConversationsView(PaginatedAPIMixin, ListAPIView):
                 .order_by("-created_at")
             )
 
-            # 4. PAGINATION
             page = self.paginate_queryset(queryset)
             if page is not None:
                 serializer = self.get_serializer(page, many=True)
                 return self.get_paginated_response(serializer.data)
 
-            # Fallback
             serializer = self.get_serializer(queryset, many=True)
             return format_response_payload(
                 success=True,
