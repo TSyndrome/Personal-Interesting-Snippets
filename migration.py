@@ -163,17 +163,10 @@ class AdminNegativeConversationSerializer(serializers.ModelSerializer):
 
 from django.db.models import Prefetch
 from django.shortcuts import get_object_or_404
-
-# 1. Import extend_schema_view
-from drf_spectacular.utils import (
-    OpenApiParameter,
-    OpenApiTypes,
-    extend_schema,
-    extend_schema_view,
-)
+from drf_spectacular.utils import OpenApiParameter, OpenApiTypes, extend_schema
 from rest_framework import status
-from rest_framework.exceptions import PermissionDenied, ValidationError
-from rest_framework.generics import ListAPIView
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
+from rest_framework.generics import GenericAPIView
 from rest_framework.permissions import IsAdminUser
 
 from .mixins import PaginatedAPIMixin
@@ -181,12 +174,58 @@ from .models import Message, Project, UserConversationHistory
 from .serializers import AdminNegativeConversationSerializer
 from .utils import format_response_payload
 
+# from .permissions import TenantAccessPermission
 
-# 2. Decorate the CLASS, targeting the 'get' method
-@extend_schema_view(
-    get=extend_schema(
+
+class AdminNegativeConversationsView(PaginatedAPIMixin, GenericAPIView):
+    """
+    Admin-only view.
+    Returns full conversation histories for any conversation that contains
+    at least one message with negative feedback (liked=False).
+    """
+
+    serializer_class = AdminNegativeConversationSerializer
+    permission_classes = [IsAdminUser, TenantAccessPermission]
+
+    def get_base_queryset(self):
+        """
+        Called by PaginatedAPIMixin to get the data.
+        Performs Validation, Security Checks, and Query Optimization.
+        """
+        # 1. VALIDATE PARAMETERS
+        project_id = self.request.query_params.get("project_id")
+        if not project_id:
+            raise ValidationError({"project_id": "This query parameter is required."})
+
+        # 2. SECURITY: FETCH PROJECT & CHECK PERMISSIONS
+        # We explicitly check permissions here because List views don't do it automatically for filtered objects.
+        try:
+            project = Project.objects.get(guid=project_id)
+        except Project.DoesNotExist:
+            raise NotFound(f"Project with GUID {project_id} not found.")
+
+        # This raises PermissionDenied if checks fail
+        self.check_object_permissions(self.request, project)
+
+        # 3. CONSTRUCT OPTIMIZED QUERY
+        messages_prefetch = Prefetch(
+            "messages",
+            queryset=Message.objects.select_related("feedback").order_by("created_at"),
+        )
+
+        return (
+            UserConversationHistory.objects.filter(
+                project=project, messages__feedback__liked=False
+            )
+            .distinct()
+            .prefetch_related(messages_prefetch)
+            .select_related("user", "project")
+            .order_by("-created_at")
+        )
+
+    @extend_schema(
         summary="List Negative Feedback Conversations",
-        description="Retrieves full conversation transcripts for any session containing negative feedback. Restricted to Admins.",
+        description="Retrieves full conversation transcripts for any session containing negative feedback.",
         parameters=[
             OpenApiParameter(
                 name="project_id",
@@ -203,71 +242,30 @@ from .utils import format_response_payload
             404: "Project Not Found",
         },
     )
-)
-class AdminNegativeConversationsView(PaginatedAPIMixin, ListAPIView):
-    """
-    Admin-only view.
-    Returns full conversation histories for any conversation that contains
-    at least one message with negative feedback (liked=False).
-    """
-
-    serializer_class = AdminNegativeConversationSerializer
-    permission_classes = [IsAdminUser, TenantAccessPermission]
-
-    def get_queryset(self):
-        return UserConversationHistory.objects.none()
-
-    # 3. Remove @extend_schema from here (it's now handled by the class decorator)
-    def list(self, request, *args, **kwargs):
-        project_id = request.query_params.get("project_id")
-
-        if not project_id:
-            return format_response_payload(
-                success=False,
-                message="Missing required parameter.",
-                errors={"project_id": "This query parameter is required."},
-                status_code=status.HTTP_400_BAD_REQUEST,
-            )
-
+    def get(self, request, *args, **kwargs):
+        """
+        API Entry point. Wraps the Mixin's list logic with error handling
+        to ensure custom response format.
+        """
         try:
-            project = get_object_or_404(Project, guid=project_id)
-            self.check_object_permissions(request, project)
+            # The Mixin calls self.get_base_queryset() internally
+            return self.list(request, *args, **kwargs)
 
-            messages_prefetch = Prefetch(
-                "messages",
-                queryset=Message.objects.select_related("feedback").order_by(
-                    "created_at"
-                ),
-            )
+        except (ValidationError, NotFound, PermissionDenied) as e:
+            # We catch the standard exceptions raised in get_base_queryset
+            # and format them into your custom payload structure.
 
-            queryset = (
-                UserConversationHistory.objects.filter(
-                    project=project, messages__feedback__liked=False
-                )
-                .distinct()
-                .prefetch_related(messages_prefetch)
-                .select_related("user", "project")
-                .order_by("-created_at")
-            )
+            # Map exception types to status codes
+            status_code = status.HTTP_400_BAD_REQUEST
+            if isinstance(e, PermissionDenied):
+                status_code = status.HTTP_403_FORBIDDEN
+            elif isinstance(e, NotFound):
+                status_code = status.HTTP_404_NOT_FOUND
 
-            page = self.paginate_queryset(queryset)
-            if page is not None:
-                serializer = self.get_serializer(page, many=True)
-                return self.get_paginated_response(serializer.data)
-
-            serializer = self.get_serializer(queryset, many=True)
-            return format_response_payload(
-                success=True,
-                message="Negative conversations retrieved successfully.",
-                data=serializer.data,
-                status_code=status.HTTP_200_OK,
-            )
-
-        except PermissionDenied:
             return format_response_payload(
                 success=False,
-                message="You do not have permission to view this project.",
-                status_code=status.HTTP_403_FORBIDDEN,
+                message=str(e.detail) if hasattr(e, "detail") else str(e),
+                status_code=status_code,
             )
         except Exception as e:
             return format_response_payload(
