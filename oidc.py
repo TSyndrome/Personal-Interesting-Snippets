@@ -614,3 +614,120 @@ urlpatterns = [
     # Admin only
     path("auth/sso-config/", views.sso_config_check, name="sso-config"),
 ]
+
+
+# cron
+import logging
+
+from cron_descriptor import ExpressionDescriptor, FormatException
+from django.db import models
+
+logger = logging.getLogger(__name__)
+
+
+class Project(models.Model):
+    name = models.CharField(max_length=255)
+    ingestion_schedule = models.CharField(max_length=100)  # The raw cron string
+
+    @property
+    def human_readable_schedule(self):
+        """
+        Converts '0 0 * * *' to 'At 12:00 AM'
+        """
+        if not self.ingestion_schedule:
+            return "No schedule defined"
+
+        try:
+            return ExpressionDescriptor(self.ingestion_schedule).get_description()
+        except FormatException:
+            # Log specific user-facing format issues as warnings
+            logger.warning(
+                f"Project {self.id} has invalid cron: {self.ingestion_schedule}"
+            )
+            return "Invalid cron format"
+        except Exception as e:
+            # Log unexpected system/library crashes as errors
+            logger.error(
+                f"Unexpected error parsing cron for Project {self.id}: {e}",
+                exc_info=True,
+            )
+            return "Error parsing schedule"
+
+
+from cron_descriptor import ExpressionDescriptor, FormatException
+from rest_framework import serializers
+
+from .models import Project
+
+
+class ProjectSerializer(serializers.ModelSerializer):
+    # This field is calculated on the fly
+    readable_schedule = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Project
+        fields = ["id", "name", "ingestion_schedule", "readable_schedule"]
+
+    def get_readable_schedule(self, obj):
+        try:
+            return ExpressionDescriptor(obj.ingestion_schedule).get_description()
+        except Exception:
+            return "Invalid schedule"
+
+    # Validation logic to ensure bad crons don't enter the system
+    def validate_ingestion_schedule(self, value):
+        try:
+            ExpressionDescriptor(value).get_description()
+        except FormatException:
+            raise serializers.ValidationError("This is not a valid cron expression.")
+        return value
+
+
+import logging
+
+from rest_framework import status
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from .serializers import ProjectSerializer
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+
+class CronConverterView(APIView):
+    """
+    Takes cron values and returns the human-readable description
+    using the ProjectSerializer logic.
+    """
+
+    def post(self, request, *args, **kwargs):
+        # 1. Initialize serializer with request data
+        # We use partial=True so we don't need to provide 'name' etc.
+        serializer = ProjectSerializer(data=request.data, partial=True)
+
+        try:
+            # 2. Validate the cron string (triggers validate_ingestion_schedule)
+            if serializer.is_valid():
+                # We return the validated data + the calculated readable_schedule
+                return Response(
+                    {
+                        "cron": serializer.validated_data["ingestion_schedule"],
+                        "description": serializer.data.get("readable_schedule"),
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+            # 3. Handle Validation Errors (e.g., malformed cron)
+            logger.warning(f"Validation failed for cron input: {serializer.errors}")
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        except Exception as e:
+            # 4. Critical Error Logging
+            logger.error(
+                f"System error during cron conversion: {str(e)}", exc_info=True
+            )
+            return Response(
+                {"error": "An unexpected error occurred processing your request."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
