@@ -774,3 +774,139 @@ application = ProtocolTypeRouter({
           │                            │    ◄──── downstream token │
           │                            │    Call Azure AI ────────►│ Azure AI
           │  ◄──── streamed results ──────────────────────────────│
+
+
+┌──────────────┐       ┌──────────────┐       ┌──────────┐
+│  React SPA   │       │  Django API  │       │ Azure AD │
+│  (OCP #1)    │       │  (OCP #2)    │       │          │
+└──────┬───────┘       └──────┬───────┘       └────┬─────┘
+       │                      │                     │
+       │ 1. User clicks       │                     │
+       │    "Login"           │                     │
+       │                      │                     │
+       │ 2. window.location = │                     │
+       │    django/oidc/login │                     │
+       │ ────────────────────►│                     │
+       │                      │                     │
+       │                      │ 3. 302 redirect ───►│
+       │                      │    to Azure AD      │
+       │ ◄─────────────────── │ (browser follows)   │
+       │ ─────────────────────────────────────────► │
+       │                      │                     │
+       │                      │    4. User logs in  │
+       │                      │       at Azure AD   │
+       │                      │                     │
+       │                      │ 5. 302 callback ◄───│
+       │                      │    /oidc/callback/  │
+       │ ─────────────────────────────────────────► │
+       │                      │◄────────────────────│
+       │                      │  ?code=abc123       │
+       │                      │                     │
+       │                      │ 6. Django exchanges  │
+       │                      │    code for tokens  │
+       │                      │    (server-to-server)│
+       │                      │ ───────────────────►│
+       │                      │ ◄───────────────────│
+       │                      │  {access_token,     │
+       │                      │   id_token,         │
+       │                      │   refresh_token}    │
+       │                      │                     │
+       │                      │ 7. Django stores    │
+       │                      │    tokens in session│
+       │                      │    Creates user +   │
+       │                      │    syncs groups     │
+       │                      │                     │
+       │ 8. 302 redirect ◄────│                     │
+       │    back to React app │                     │
+       │    + Set-Cookie:     │                     │
+       │      sessionid=xyz   │                     │
+       │                      │                     │
+       │ 9. React loads,      │                     │
+       │    has session cookie│                     │
+       │                      │                     │
+       │ 10. GET /api/stuff   │                     │
+       │     Cookie: session  │                     │
+       │ ────────────────────►│                     │
+       │                      │ session → user      │
+       │ ◄──── response ──────│                     │
+       │                      │                     │
+       │ 11. WebSocket        │                     │
+       │     Cookie: session  │                     │
+       │ ════════════════════►│                     │
+       │                      │ session → user      │
+       │                      │                     │
+       │                      │ 12. OBO call        │
+       │                      │ (has tokens in      │
+       │                      │  session already)   │
+       │                      │ ───────────────────►│
+       │                      │ ◄── downstream token│
+       │                      │ ──► Azure AI        │
+
+// Every frontend request needs
+fetch('/api/...', { credentials: 'include' })
+axios.defaults.withCredentials = true;
+```
+
+And you'll fight CSRF on every non-GET DRF request. DRF's `SessionAuthentication` enforces CSRF, so you either need to fetch a CSRF token first or exempt endpoints (which is a security tradeoff).
+
+### Problem 2: Full-Page Redirects Break SPA Experience
+```
+User clicks Login
+  → browser leaves React entirely
+  → goes to Django /oidc/login/
+  → goes to Azure AD
+  → comes back to Django /oidc/callback/
+  → redirects back to React
+  → React app re-initializes from scratch
+  → any client-side state is lost
+```
+
+With MSAL.js, login happens in a popup or a redirect that MSAL manages, preserving app state.
+
+### Problem 3: Token Refresh Is Your Problem
+```
+Backend-managed:                    MSAL.js frontend:
+─────────────────                   ─────────────────
+Access token expires                Access token expires
+→ next API call fails               → acquireTokenSilent()
+→ need to detect 401                → MSAL auto-refreshes
+→ redirect user to                    using refresh token
+  /oidc/login/ again?               → seamless, no redirect
+→ or build a /refresh-token          → user notices nothing
+  endpoint in Django
+→ manage refresh logic yourself
+```
+
+### Problem 4: WebSocket Gets Simpler but Everything Else Gets Harder
+
+The one advantage — WebSocket just works with the session cookie. But you're trading that for pain everywhere else.
+
+---
+
+## Side-by-Side Comparison
+```
+                          │ Backend OIDC          │ Frontend MSAL.js
+──────────────────────────┼───────────────────────┼────────────────────
+Login UX                  │ Full page redirects   │ Popup/redirect,
+                          │ SPA state lost        │ SPA state preserved
+                          │                       │
+Cross-origin cookies      │ SameSite=None,        │ Not needed,
+                          │ CSRF headaches        │ Bearer token in header
+                          │                       │
+DRF auth                  │ SessionAuthentication │ AdfsAccessTokenAuth
+                          │ + CSRF middleware     │ stateless, no CSRF
+                          │                       │
+Token refresh             │ You build it          │ MSAL handles it
+                          │                       │
+WebSocket auth            │ Cookie automatic      │ First-message token
+                          │                       │ (few lines of code)
+                          │                       │
+OBO flow                  │ Token from session    │ Token from header
+                          │ (slightly simpler)    │ (slightly more explicit)
+                          │                       │
+Scalability               │ Sticky sessions or    │ Stateless, any
+                          │ shared session store  │ replica handles any
+                          │ (Redis required)      │ request
+                          │                       │
+Two OCP containers        │ Fighting cookies      │ Just works
+                          │ across origins        │       
