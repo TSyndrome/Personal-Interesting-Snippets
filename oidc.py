@@ -731,3 +731,46 @@ class CronConverterView(APIView):
                 {"error": "An unexpected error occurred processing your request."},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+# asgi.py
+from channels.routing import ProtocolTypeRouter, URLRouter
+
+application = ProtocolTypeRouter({
+    "http": get_asgi_application(),
+    "websocket": URLRouter(
+        websocket_urlpatterns
+        # No auth middleware wrapping — consumer handles it
+    ),
+})
+```
+
+---
+
+## Updated Complete Flow for Your OCP Setup
+```
+┌─────────────────────┐         ┌──────────────┐         ┌─────────────────┐
+│  React SPA          │         │  Azure AD    │         │  Django API     │
+│  (OCP Container 1)  │         │              │         │  (OCP Container 2)│
+└─────────┬───────────┘         └──────┬───────┘         └────────┬────────┘
+          │                            │                          │
+          │  1. MSAL.js login ────────►│                          │
+          │  ◄──── tokens (id+access) ─│                          │
+          │                            │                          │
+          │  2. REST: Bearer token ───────────────────────────────►│
+          │     (any DRF endpoint)     │    django-auth-adfs:     │
+          │                            │    - validates token      │
+          │                            │    - creates user if new  │
+          │                            │    - syncs groups         │
+          │  ◄──────────────────────── response ──────────────────│
+          │                            │                          │
+          │  3. WebSocket connect ────────────────────────────────►│
+          │     ws.send({type:'authenticate', token:'...'}) ─────►│
+          │                            │    - validates token      │
+          │                            │    - creates user if new  │
+          │  ◄──── {type:'auth_success'} ─────────────────────────│
+          │                            │                          │
+          │  4. ws.send({query:'...'}) ──────────────────────────►│
+          │                            │    OBO exchange ─────────►│ Azure AD
+          │                            │    ◄──── downstream token │
+          │                            │    Call Azure AI ────────►│ Azure AI
+          │  ◄──── streamed results ──────────────────────────────│
