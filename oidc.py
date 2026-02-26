@@ -1487,33 +1487,34 @@ User = get_user_model()
 
 class UserConversationHistoryAPIViewTests(APITestCase):
     
-    @classmethod
-    def setUpTestData(cls):
+    def setUp(self):
+        """Runs before every single test method to set up fresh data."""
         # 1. Create Users
-        cls.user_a = User.objects.create_user(username="user_a", password="testpass123")
-        cls.user_b = User.objects.create_user(username="user_b", password="testpass123")
-        cls.admin_user = User.objects.create_user(username="admin", password="testpass123")
+        self.user_a = User.objects.create_user(username="user_a", password="testpass123")
+        self.user_b = User.objects.create_user(username="user_b", password="testpass123")
+        self.admin_user = User.objects.create_user(username="admin", password="testpass123")
         
-        # Note: You may need to assign tenant/project access to these users here 
-        # based on how your `tenant_access_mnemonics` property works.
+        # Note: Set up tenant/project access for these users here 
+        # based on your specific implementation (e.g., self.admin_user.is_platform_admin = True)
 
         # 2. Create Projects
-        cls.project_1 = Project.objects.create(name="Project 1", mnemonic="proj1")
-        cls.project_2 = Project.objects.create(name="Project 2", mnemonic="proj2")
+        self.project_1 = Project.objects.create(name="Project 1", mnemonic="proj1")
+        self.project_2 = Project.objects.create(name="Project 2", mnemonic="proj2")
 
         # 3. Create Conversations
-        cls.conv_user_a = UserConversationHistory.objects.create(
-            user=cls.user_a, project=cls.project_1, preview_title="User A Query"
+        self.conv_user_a = UserConversationHistory.objects.create(
+            user=self.user_a, project=self.project_1, preview_title="User A Query"
         )
-        cls.conv_user_b = UserConversationHistory.objects.create(
-            user=cls.user_b, project=cls.project_1, preview_title="User B Query"
+        self.conv_user_b = UserConversationHistory.objects.create(
+            user=self.user_b, project=self.project_1, preview_title="User B Query"
         )
-        cls.conv_admin = UserConversationHistory.objects.create(
-            user=cls.admin_user, project=cls.project_2, preview_title="Admin Query"
+        self.conv_admin = UserConversationHistory.objects.create(
+            user=self.admin_user, project=self.project_2, preview_title="Admin Query"
         )
         
         # 4. Define the endpoint URL (Update 'conversation-list' to match your urls.py)
-        cls.url = reverse('conversation-list') 
+        # Using a dummy URL path if reverse is tricky to set up in isolation
+        self.url = '/api/conversations/' # reverse('conversation-list') 
 
     def test_user_can_only_see_own_conversations(self):
         """Standard users should only see their own chat history."""
@@ -1522,10 +1523,10 @@ class UserConversationHistoryAPIViewTests(APITestCase):
         response = self.client.get(self.url)
         
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        # Extract the IDs from the paginated response (adjust 'data' parsing based on your mixin's payload)
+        
+        # Adjust 'data' parsing based on your mixin's format_response_payload
         response_data = response.json()
-        # Assuming your format_response_payload wraps data in a 'data' key or similar list
-        results = response_data if isinstance(response_data, list) else response_data.get('results', [])
+        results = response_data if isinstance(response_data, list) else response_data.get('data', [])
         
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]['id'], self.conv_user_a.id)
@@ -1534,14 +1535,12 @@ class UserConversationHistoryAPIViewTests(APITestCase):
         """Ensure User A cannot query User B's conversations by manipulating parameters."""
         self.client.force_authenticate(user=self.user_a)
         
-        # Even if User A tries to pass User B's ID or exact project, the base queryset should block it
+        # Attempting to filter by another user's ID
         response = self.client.get(f"{self.url}?user={self.user_b.id}")
         
-        # Assuming the response format returns a list of results
-        results = response.json() if isinstance(response.json(), list) else response.json().get('results', [])
+        results = response.json() if isinstance(response.json(), list) else response.json().get('data', [])
         
-        # It should still only return User A's data, ignoring the malicious parameter, 
-        # or return empty if the filter parameter conflicts with the base queryset.
+        # Should not return User B's data
         for item in results:
             self.assertNotEqual(item['id'], self.conv_user_b.id)
 
@@ -1549,15 +1548,15 @@ class UserConversationHistoryAPIViewTests(APITestCase):
         """Testing the optional query parameter filter for projects."""
         self.client.force_authenticate(user=self.user_a)
         
-        # Test filtering by a project the user has data in
+        # Filter by a project the user has data in
         response = self.client.get(f"{self.url}?project_guid={self.project_1.guid}")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         
-        # Test filtering by a project the user has NO data in
+        # Filter by a project the user has NO data in (but exists)
         response_empty = self.client.get(f"{self.url}?project_guid={self.project_2.guid}")
         self.assertEqual(response_empty.status_code, status.HTTP_200_OK)
         
-        results_empty = response_empty.json() if isinstance(response_empty.json(), list) else response_empty.json().get('results', [])
+        results_empty = response_empty.json() if isinstance(response_empty.json(), list) else response_empty.json().get('data', [])
         self.assertEqual(len(results_empty), 0)
 
     def test_date_filters(self):
@@ -1571,6 +1570,6 @@ class UserConversationHistoryAPIViewTests(APITestCase):
         response = self.client.get(f"{self.url}?created_at_start={today}&created_at_end={tomorrow}")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        # Invalid date format should trigger the ValueError handled in the view's get() method
+        # Invalid date format should trigger 400 Bad Request
         response_invalid = self.client.get(f"{self.url}?created_at_start=invalid-date")
         self.assertEqual(response_invalid.status_code, status.HTTP_400_BAD_REQUEST)
