@@ -1372,3 +1372,105 @@ class UserConversationHistoryView(PaginatedAPIMixin, APIView):
             queryset = queryset.filter(created_at__lte=end_date)
 
         return queryset
+
+
+#geminifrom rest_framework.views import APIView
+from rest_framework import status
+from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
+
+class UserConversationHistoryView(PaginatedAPIMixin, APIView):
+    """
+    API view for retrieving and filtering conversation history.
+    """
+    model = UserConversationHistory 
+    serializer_class = UserConversationHistoryMinimalSerializer
+    pagination_class = APIPagination
+    filter_definitions = USER_CONVERSATION_HISTORY_SUPPORTED_FILTERS
+    sort_config_map = USER_CONVERSATION_HISTORY_SORT_FIELD_MAP
+    default_sort_key = DEFAULT_API_SORT_FIELD
+    default_sort_direction = DEFAULT_SORT_DIRECTION
+    related_fields = ["user", "project"]
+
+    def get_base_queryset(self):
+        """
+        Overrides the mixin's default method.
+        We apply Trevor's permission union logic here because the custom 
+        PaginatedAPIMixin does not automatically invoke filter_backends.
+        """
+        # 1. Base optimization
+        queryset = self.model.objects.defer(
+            "retrieved_documents", "metadata", "conversation_thread", 
+            "chat_config_used", "chat_config_version_used"
+        )
+
+        # 2. Apply Trevor's Permission Logic
+        user_queryset = TenantAccessFilterBackend().filter_queryset(
+            self.request, queryset, self
+        ).filter(user=self.request.user)
+        
+        admin_queryset = TenantAdminFilterBackend().filter_queryset(
+            self.request, queryset, self
+        )
+        
+        # Set union and distinct to prevent duplicates
+        queryset = (user_queryset | admin_queryset).distinct()
+
+        # 3. Handle Optional Project Filter (Query Params, NOT Headers)
+        project_guid = self.request.query_params.get("project_guid")
+        if project_guid:
+            queryset = queryset.filter(project__guid=project_guid)
+
+        # 4. Handle Dates
+        created_at_start = self.request.query_params.get("created_at_start")
+        created_at_end = self.request.query_params.get("created_at_end")
+        
+        if created_at_start or created_at_end:
+            queryset = self._validate_dates(created_at_start, created_at_end, queryset)
+
+        # Return the fully secured and filtered queryset to the mixin's list() method
+        return queryset
+
+    def get(self, request, *args, **kwargs):
+        """
+        Retrieve filtered RAG conversations based on provided parameters.
+        """
+        try:
+            return self.list(request)
+        except ValueError as e:
+            return format_response_payload(
+                success=False,
+                message=str(e),
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception as e:
+            logger.error(f"Error retrieving conversations: {str(e)}")
+            return format_response_payload(
+                success=False,
+                errors=str(e),
+                message="An unexpected error occurred.",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def _validate_dates(self, created_at_start, created_at_end, queryset):
+        """
+        Helper function to validate and apply date filters.
+        MUST return the modified queryset.
+        """
+        if created_at_start:
+            try:
+                start_date = datetime.strptime(created_at_start, "%Y-%m-%d")
+                queryset = queryset.filter(created_at__gte=start_date)
+            except ValueError:
+                raise ValueError("Invalid created_at_start format. Use YYYY-MM-DD.")
+                
+        if created_at_end:
+            try:
+                end_date = datetime.strptime(created_at_end, "%Y-%m-%d")
+                queryset = queryset.filter(created_at__lte=end_date)
+            except ValueError:
+                raise ValueError("Invalid created_at_end format. Use YYYY-MM-DD.")
+                
+        return queryset
