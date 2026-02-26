@@ -910,3 +910,465 @@ Scalability               │ Sticky sessions or    │ Stateless, any
                           │                       │
 Two OCP containers        │ Fighting cookies      │ Just works
                           │ across origins        │       
+
+
+from datetime import datetime
+from django.db.models import Q
+from rest_framework import status
+from rest_framework.views import APIView
+
+# Replace 'your_app' with the actual module names in your project
+from your_app.models import UserConversationHistory, Project
+from your_app.serializers import UserConversationHistoryMinimalSerializer
+from your_app.filters import (
+    TenantAccessFilterBackend,
+    TenantAdminFilterBackend,
+    TenantGuidFilterBackend,
+)
+
+class UserConversationHistoryView(PaginatedAPIMixin, APIView):
+    """
+    API view for retrieving and filtering conversation history.
+    Users see their own chats; Project Admins see all chats in their projects.
+    """
+    model = UserConversationHistory
+    serializer_class = UserConversationHistoryMinimalSerializer
+    pagination_class = APIPagination
+    related_fields = ["user", "project"]
+
+    def get_base_queryset(self):
+        """
+        Initial queryset with field deferral for performance.
+        Removed Project-Guid header logic per user's feedback.
+        """
+        return UserConversationHistory.objects.defer(
+            "retrieved_documents",
+            "metadata",
+            "conversation_thread",
+            "chat_config_used",
+            "chat_config_version_used",
+        ).select_related(*self.related_fields)
+
+    def filter_queryset(self, queryset):
+        """
+        Enforces security and handles optional filtering.
+        """
+        request = self.request
+        
+        # 1. Date Range Filtering
+        created_at_start = request.query_params.get("created_at_start")
+        created_at_end = request.query_params.get("created_at_end")
+        queryset = self.validate_dates(created_at_start, created_at_end, queryset)
+
+        # 2. Standardized Project/Tenant Filtering (Query Params only)
+        # We check the common keys user mentioned.
+        project_id = (
+            request.query_params.get("project_id") or 
+            request.query_params.get("project_guid") or 
+            request.query_params.get("tenant_id")
+        )
+        if project_id:
+            queryset = queryset.filter(project__guid=project_id)
+
+        # 3. Apply standard non-tenant filter backends (e.g., Search, Sort)
+        # We skip the tenant backends here because we use them manually below.
+        tenant_backends = {TenantAccessFilterBackend, TenantAdminFilterBackend, TenantGuidFilterBackend}
+        for backend_cls in list(self.filter_backends):
+            if backend_cls not in tenant_backends:
+                queryset = backend_cls().filter_queryset(request, queryset, self)
+
+        # 4. Role-Based Access Logic (The "user Union")
+        if getattr(request.user, 'is_platform_admin', False):
+            return queryset
+
+        # OWNER VIEW: Their own chats in projects they have access to
+        owner_view = TenantAccessFilterBackend().filter_queryset(
+            request, queryset, self
+        ).filter(user=request.user)
+
+        # ADMIN VIEW: All chats in projects they administer
+        admin_view = TenantAdminFilterBackend().filter_queryset(
+            request, queryset, self
+        )
+
+        # Merge results and ensure uniqueness
+        return (owner_view | admin_view).distinct()
+
+    def get(self, request, *args, **kwargs):
+        try:
+            # .list() is provided by PaginatedAPIMixin and calls filter_queryset()
+            return self.list(request)
+        except ValueError as e:
+            return format_response_payload(
+                success=False,
+                message=str(e),
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception as e:
+            logger.error(f"Error retrieving conversations: {str(e)}")
+            return format_response_payload(
+                success=False,
+                message="An unexpected error occurred.",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def validate_dates(self, start, end, queryset):
+        """
+        Parses date strings and applies filters. 
+        Returns the modified queryset.
+        """
+        if start:
+            try:
+                start_dt = datetime.strptime(start, "%Y-%m-%d")
+                queryset = queryset.filter(created_at__gte=start_dt)
+            except ValueError:
+                raise ValueError("Invalid created_at_start format. Use YYYY-MM-DD.")
+        if end:
+            try:
+                end_dt = datetime.strptime(end, "%Y-%m-%d")
+                queryset = queryset.filter(created_at__lte=end_dt)
+            except ValueError:
+                raise ValueError("Invalid created_at_end format. Use YYYY-MM-DD.")
+        return queryset
+
+from django.urls import reverse
+from django.contrib.auth import get_user_model
+from rest_framework.test import APITestCase
+from rest_framework import status
+from your_app.models import UserConversationHistory, Project
+
+User = get_user_model()
+
+class UserConversationHistorySecurityTests(APITestCase):
+    def setUp(self):
+        # Create Projects
+        self.project_a = Project.objects.create(name="Project Alpha", mnemonic="alpha")
+        self.project_b = Project.objects.create(name="Project Beta", mnemonic="beta")
+
+        # Create Users
+        self.user_owner = User.objects.create_user(username="owner", password="password")
+        self.user_stranger = User.objects.create_user(username="stranger", password="password")
+        self.user_admin = User.objects.create_user(username="admin", password="password")
+
+        # Setup User Permissions (Assuming custom attributes used in backends)
+        self.user_owner.tenant_access_mnemonics = ["alpha"]
+        self.user_owner.save()
+        
+        self.user_admin.tenant_admin_mnemonics = ["alpha"]
+        self.user_admin.save()
+
+        # Create Conversations
+        self.convo_owner = UserConversationHistory.objects.create(
+            user=self.user_owner, project=self.project_a, preview_title="Owner's Chat"
+        )
+        self.convo_other = UserConversationHistory.objects.create(
+            user=self.user_stranger, project=self.project_a, preview_title="Stranger's Chat"
+        )
+
+        self.url = reverse('conversation-history-list') # Update with your actual URL name
+
+    def test_owner_sees_only_own_chats(self):
+        """Verify a standard user cannot see others' chats in the same project."""
+        self.client.login(username="owner", password="password")
+        response = self.client.get(self.url)
+        
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # Should see their own chat, but NOT the stranger's chat
+        results = response.data.get('results', [])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['id'], self.convo_owner.id)
+
+    def test_admin_sees_all_chats_in_project(self):
+        """Verify a project admin can see all chats within their project."""
+        self.client.login(username="admin", password="password")
+        response = self.client.get(self.url)
+        
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # Admin should see both conversations in Project Alpha
+        results = response.data.get('results', [])
+        self.assertEqual(len(results), 2)
+
+    def test_idor_prevention_via_query_param(self):
+        """Verify that passing a specific user ID doesn't leak data."""
+        self.client.login(username="owner", password="password")
+        # Attempting to filter specifically for the other user's ID
+        response = self.client.get(f"{self.url}?user={self.user_stranger.id}")
+        
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # Should return empty or only their own (depending on backend), 
+        # but NEVER the stranger's data.
+        for item in response.data.get('results', []):
+            self.assertNotEqual(item['id'], self.convo_other.id)
+
+    def test_project_filter_standardization(self):
+        """Verify ?project_id query parameter works (user's suggestion)."""
+        self.client.login(username="admin", password="password")
+        response = self.client.get(f"{self.url}?project_id={self.project_a.guid}")
+        
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(all(r['project'] == self.project_a.id for r in response.data.get('results', [])))
+
+    def test_invalid_date_format_returns_400(self):
+        """Ensure date validation logic correctly triggers a 400 error."""
+        self.client.login(username="owner", password="password")
+        response = self.client.get(f"{self.url}?created_at_start=invalid-date")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+#claude
+"""
+Rewritten UserConversationHistoryView
+
+CRITICAL ANALYSIS OF user'S REVIEW COMMENTS
+==============================================
+
+COMMENT 1: "Why is there data being stored in headers? ... The proper way to
+add a filter to a REST endpoint is with a query parameter."
+
+    VERDICT: ✅ Agree. Using headers for filtering is an anti-pattern. HTTP
+    headers are for metadata (auth tokens, content-type, caching directives),
+    not business-level filtering. Moved project_guid to a query parameter to
+    align with REST conventions and the existing `created_at_start`/`created_at_end`
+    params which already use query parameters. This also matches the codebase
+    convention user references: `request.params["tenant_id"]`.
+
+COMMENT 2: "Why are we checking if the user has permission to view the project
+that they are filtering on, when we are also filtering the queryset according
+to projects the user has appropriate permissions on? This is redundant with
+the filterbackend."
+
+    VERDICT: ✅ Mostly agree, with a nuance. The permission check IS redundant
+    if the filter backends already constrain the queryset to accessible projects.
+    A user filtering by a project_guid they can't access will simply get an empty
+    result set — the filter backend ensures no unauthorized data leaks.
+
+    TRADE-OFF: The original code would raise a 403 if you requested a project
+    you can't see. The filter-backend-only approach returns 200 with empty results.
+    This is actually *better* from a security standpoint — returning 403 confirms
+    the resource exists (information leakage). Returning empty results reveals
+    nothing. So removing the explicit permission check is both simpler and more
+    secure.
+
+COMMENT 3: "We want users to be able to see two kinds of conversations:
+1. their own conversations in tenants they are users on
+2. all conversations of projects that they administrate"
+
+    VERDICT: ✅ Agree on the business requirement, with refinements to the
+    proposed implementation. user's suggested code does the union correctly:
+        user_queryset | admin_queryset
+    However, we should be mindful of:
+
+    a) The `.distinct()` is necessary since a user who is both a tenant member
+       AND an admin of a project could get duplicate rows from the union.
+
+    b) The original `get_base_queryset` was doing `.defer()` on heavy fields —
+       this optimization must be preserved on the base queryset BEFORE it gets
+       passed to the filter backends, so both branches benefit from it.
+
+    c) user suggests putting this in `filter_queryset()` rather than
+       `get_base_queryset()`. This is correct — `get_base_queryset` in the mixin
+       is meant for basic queryset setup (model selection, defer, select_related),
+       while `filter_queryset` is where access-control filtering belongs. The
+       mixin's `list()` method calls `get_base_queryset()` then `filter_queryset()`,
+       so the access control union should live in `filter_queryset`.
+
+ADDITIONAL ISSUES FOUND IN ORIGINAL CODE
+=========================================
+
+1. `model = None` — The PaginatedAPIMixin explicitly raises ImproperlyConfigured
+   if model is None (line 73-74 in the mixin). Setting this to None and then
+   overriding get_base_queryset to avoid the check is fragile. We should set
+   the model explicitly.
+
+2. `_validate_dates` mutates via queryset parameter but the method name suggests
+   validation only. Renamed to `_apply_date_filters` for clarity, and it now
+   returns the filtered queryset explicitly (functional style, no hidden mutation).
+
+3. The original `get_base_queryset` mixed access control (project_guid permission
+   check) with query filtering (date ranges). These are separate concerns:
+   - Access control → filter_queryset (what CAN you see)
+   - Query filtering → get_base_queryset or the mixin's filter pipeline (what
+     do you WANT to see)
+"""
+
+from datetime import datetime
+import logging
+
+from rest_framework import status
+from rest_framework.views import APIView
+
+# These imports would come from your project — kept as references
+# from rag_search.models import UserConversationHistory, Project
+# from rag_search.serializers import UserConversationHistoryMinimalSerializer
+# from rag_search.pagination import APIPagination
+# from rag_search.permissions import TenantAccessFilterBackend, TenantAdminFilterBackend
+# from rag_search.constants import (
+#     USER_CONVERSATION_HISTORY_SUPPORTED_FILTERS,
+#     USER_CONVERSATION_HISTORY_SORT_FIELD_MAP,
+#     DEFAULT_API_SORT_FIELD,
+#     DEFAULT_SORT_DIRECTION,
+# )
+# from rag_search.utils import format_response_payload
+# from rag_search.mixins import PaginatedAPIMixin
+
+logger = logging.getLogger(__name__)
+
+
+class UserConversationHistoryView(PaginatedAPIMixin, APIView):
+    """
+    API view for retrieving and filtering conversation history.
+
+    Access model:
+        - Users see their own conversations within tenants they belong to.
+        - Admins see ALL conversations for projects they administrate.
+        These two sets are unioned and deduplicated.
+
+    Supports filtering by:
+        - project_guid  (query parameter)
+        - created_at_start  (query parameter, format: YYYY-MM-DD)
+        - created_at_end    (query parameter, format: YYYY-MM-DD)
+
+    Sorting and pagination are handled by PaginatedAPIMixin.
+    """
+
+    model = UserConversationHistory
+    serializer_class = UserConversationHistoryMinimalSerializer
+    pagination_class = APIPagination
+    filter_definitions = USER_CONVERSATION_HISTORY_SUPPORTED_FILTERS
+    sort_config_map = USER_CONVERSATION_HISTORY_SORT_FIELD_MAP
+    default_sort_key = DEFAULT_API_SORT_FIELD
+    default_sort_direction = DEFAULT_SORT_DIRECTION
+    related_fields = ["user", "project"]
+
+    # ------------------------------------------------------------------ #
+    #  Queryset construction
+    # ------------------------------------------------------------------ #
+
+    def get_base_queryset(self):
+        """
+        Return the base queryset with performance optimizations.
+
+        Heavy fields that the list/history UI does not need are deferred.
+        Access-control filtering is intentionally NOT done here — that
+        belongs in filter_queryset() so it runs through the standard
+        DRF filter-backend pipeline.
+        """
+        return UserConversationHistory.objects.defer(
+            "retrieved_documents",
+            "metadata",
+            "conversation_thread",
+            "chat_config_used",
+            "chat_config_version_used",
+        )
+
+    def filter_queryset(self, queryset):
+        """
+        Apply tenant-based access control, then delegate to the mixin's
+        standard filter pipeline (filter backends, sorting, etc.).
+
+        Business rule (per user's review):
+            visible = (user's own conversations in accessible tenants)
+                    ∪ (all conversations in projects user administrates)
+
+        After the access-control union, optional query-parameter filters
+        (project_guid, date range) are applied.
+        """
+        # --- Access control: union of two permission scopes --- #
+        user_queryset = TenantAccessFilterBackend().filter_queryset(
+            self.request, queryset, self
+        ).filter(user=self.request.user)
+
+        admin_queryset = TenantAdminFilterBackend().filter_queryset(
+            self.request, queryset, self
+        )
+
+        queryset = (user_queryset | admin_queryset).distinct()
+
+        # --- Optional project filter (query param, NOT header) --- #
+        project_guid = self.request.GET.get("project_guid")
+        if project_guid:
+            queryset = queryset.filter(project__guid=project_guid)
+            # No explicit permission check needed — the union above already
+            # guarantees the user can only see projects they have access to.
+            # If the guid doesn't match any accessible project, the result
+            # is simply empty (no information leakage).
+
+        # --- Date range filters --- #
+        created_at_start = self.request.GET.get("created_at_start")
+        created_at_end = self.request.GET.get("created_at_end")
+        queryset = self._apply_date_filters(created_at_start, created_at_end, queryset)
+
+        # --- Delegate remaining filters (sort, etc.) to mixin --- #
+        # The parent's filter_queryset applies filter_backends from settings.
+        # We skip calling super().filter_queryset() here because we've already
+        # applied the tenant filter backends manually above. If additional
+        # generic backends (e.g. ordering) are configured in
+        # DEFAULT_FILTER_BACKENDS, you may want to selectively apply those:
+        #
+        #   for backend in list(self.filter_backends):
+        #       if backend not in (TenantAccessFilterBackend, TenantAdminFilterBackend):
+        #           queryset = backend().filter_queryset(self.request, queryset, self)
+
+        return queryset
+
+    # ------------------------------------------------------------------ #
+    #  HTTP method handler
+    # ------------------------------------------------------------------ #
+
+    def get(self, request):
+        """
+        Retrieve filtered RAG conversations based on provided parameters.
+        If no filters are specified, return all accessible conversations.
+        """
+        try:
+            return self.list(request)
+
+        except ValueError as e:
+            return format_response_payload(
+                success=False,
+                message=str(e),
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+
+        except Exception as e:
+            logger.error(f"Error retrieving conversations: {str(e)}")
+            return format_response_payload(
+                success=False,
+                errors=str(e),
+                message="An unexpected error occurred.",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    # ------------------------------------------------------------------ #
+    #  Private helpers
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _apply_date_filters(created_at_start, created_at_end, queryset):
+        """
+        Validate and apply date-range filters to the queryset.
+
+        Raises ValueError with a descriptive message on invalid input,
+        which the get() handler catches and returns as a 400.
+        """
+        date_format = "%Y-%m-%d"
+
+        if created_at_start:
+            try:
+                start_date = datetime.strptime(created_at_start, date_format)
+            except ValueError:
+                raise ValueError(
+                    "Invalid created_at_start format. Use YYYY-MM-DD."
+                )
+            queryset = queryset.filter(created_at__gte=start_date)
+
+        if created_at_end:
+            try:
+                end_date = datetime.strptime(created_at_end, date_format)
+            except ValueError:
+                raise ValueError(
+                    "Invalid created_at_end format. Use YYYY-MM-DD."
+                )
+            queryset = queryset.filter(created_at__lte=end_date)
+
+        return queryset
