@@ -1636,3 +1636,34 @@ def get_base_queryset(self):
             "retrieved_documents", "metadata", "conversation_thread", 
             "chat_config_used", "chat_config_version_used"
         )
+
+Summary
+This PR addresses a critical data isolation vulnerability in the UserConversationHistoryView. Previously, non-admin users could bypass security and view chat logs from other users or tenants by manipulating request parameters. This update enforces strict row-level security by dynamically evaluating the user's tenant access and admin privileges, ensuring users only see their own conversations or conversations within projects they administer.
+
+It also incorporates code review feedback by standardizing on query parameters instead of headers, fixes an Oracle DB limitation with DISTINCT queries, and adds comprehensive test coverage.
+
+Key Changes
+
+Enforced Row-Level Security: Implemented a union of TenantAccessFilterBackend (filtered by the request.user) and TenantAdminFilterBackend to safely enforce the permission matrix.
+
+Fixed Oracle DISTINCT LOB Crash: Replaced .distinct() on the raw queryset with an id__in subquery to prevent ORA-00932 errors on LOB columns (like TextField and JSONField).
+
+Standardized API Filtering: Moved the project filter from the Project-Guid header to a standard project_guid query parameter.
+
+Maintained N+1 Optimizations: explicitly re-implemented .select_related() and .defer() optimizations to prevent performance regressions while bypassing super().get_base_queryset() to maintain strict control over query state.
+
+Fixed filtering.py Typo: Corrected a critical typo in TenantAdminFilterBackend where tenant_access_mnemonics was being evaluated instead of tenant_admin_mnemonics.
+
+Fixed Date Filtering Bug: Patched _validate_dates so it properly returns the updated queryset instead of None.
+
+Testing Performed
+
+Added UserConversationHistoryAPIViewTests suite.
+
+Verified standard users can only access their own conversations (test_user_can_only_see_own_conversations).
+
+Verified cross-tenant data leaks are actively blocked (test_cross_tenant_data_leak_prevented).
+
+Verified tenant admins can see all conversations within their assigned projects without returning duplicates (test_union_does_not_return_duplicates).
+
+Verified project_guid, created_at_start, and created_at_end optional filters return 200 OK and accurate datasets.
