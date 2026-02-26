@@ -1573,3 +1573,66 @@ class UserConversationHistoryAPIViewTests(APITestCase):
         # Invalid date format should trigger 400 Bad Request
         response_invalid = self.client.get(f"{self.url}?created_at_start=invalid-date")
         self.assertEqual(response_invalid.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_union_does_not_return_duplicates(self):
+        """
+        Ensures that if a user is BOTH the creator of a conversation AND 
+        an admin of the project, the API only returns the conversation once.
+        """
+        self.client.force_authenticate(user=self.admin_user)
+        
+        # In setup(), we already created self.conv_admin where:
+        # user = self.admin_user AND project = self.project_2
+        # Assuming admin_user is an admin of project_2 via TenantAdminFilterBackend...
+        
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        
+        results = response.json() if isinstance(response.json(), list) else response.json().get('data', [])
+        
+        # It should return exactly 1 record, not 2, proving the distinct() logic worked.
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['id'], self.conv_admin.id)
+
+def get_base_queryset(self):
+        """
+        Overrides the mixin's default method to apply security and Oracle fixes,
+        while maintaining the mixin's select_related optimizations.
+        """
+        # 1. Evaluate permissions on a raw, unoptimized queryset
+        base_qs = self.model.objects.all()
+
+        user_queryset = TenantAccessFilterBackend().filter_queryset(
+            self.request, base_qs, self
+        ).filter(user=self.request.user)
+        
+        admin_queryset = TenantAdminFilterBackend().filter_queryset(
+            self.request, base_qs, self
+        )
+        
+        # 2. Extract ONLY the IDs (The Oracle-safe distinct workaround)
+        combined_qs = user_queryset | admin_queryset
+        unique_ids = combined_qs.values_list('id', flat=True).distinct()
+
+        # 3. Fetch the baseline optimized queryset from the Mixin!
+        # This line automatically applies .select_related("user", "project") 
+        # because of your related_fields class attribute.
+        queryset = super().get_base_queryset().filter(id__in=unique_ids)
+
+        # 4. Optional Project Filter (Query Params)
+        project_guid = self.request.query_params.get("project_guid")
+        if project_guid:
+            queryset = queryset.filter(project__guid=project_guid)
+
+        # 5. Handle Dates
+        created_at_start = self.request.query_params.get("created_at_start")
+        created_at_end = self.request.query_params.get("created_at_end")
+        
+        if created_at_start or created_at_end:
+            queryset = self._validate_dates(created_at_start, created_at_end, queryset)
+
+        # 6. Apply LOB defer optimization last
+        return queryset.defer(
+            "retrieved_documents", "metadata", "conversation_thread", 
+            "chat_config_used", "chat_config_version_used"
+        )
