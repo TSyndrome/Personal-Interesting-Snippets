@@ -1667,3 +1667,46 @@ Verified cross-tenant data leaks are actively blocked (test_cross_tenant_data_le
 Verified tenant admins can see all conversations within their assigned projects without returning duplicates (test_union_does_not_return_duplicates).
 
 Verified project_guid, created_at_start, and created_at_end optional filters return 200 OK and accurate datasets.
+
+import logging
+from django.contrib.auth.signals import user_logged_in
+from django.dispatch import receiver
+
+logger = logging.getLogger('myapp.signals')
+
+@receiver(user_logged_in)
+def log_azure_groups(sender, request, user, **kwargs):
+    # Raw claims from Azure (attached by django-auth-adfs)
+    claims = getattr(request, 'adfs_claims', None)
+    
+    if claims and 'groups' in claims:
+        azure_groups = claims['groups']                    # list of GUIDs
+        django_groups = [g.name for g in user.groups.all()]  # mirrored Django groups
+        
+        logger.info("=== AZURE SSO GROUPS ===")
+        logger.info(f"User: {user.username} / {user.email}")
+        logger.info(f"Raw Azure groups (GUIDs): {azure_groups}")
+        logger.info(f"Mirrored into Django groups: {django_groups}")
+        logger.info("=========================")
+    else:
+        logger.warning("No groups claim found in token!")
+
+'loggers': {
+        'django_auth_adfs': {
+            'handlers': ['console'],
+            'level': 'DEBUG',           # ← shows full claims + groups
+            'propagate': True,
+        },
+        'myapp.signals': {              # ← for the custom groups logger below
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': True,
+        },
+        'django.request': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': True,
+        },
+    },
+
+
